@@ -4,7 +4,9 @@
 module Gibbon.HaskellFrontend
   ( parseFile, primMap, multiArgsToOne ) where
 
+import Data.Char        ( isUpper, isAlphaNum )
 import           Data.Foldable ( foldrM )
+import           Data.Graph
 import           Data.Loc as Loc
 import           Data.Maybe (catMaybes)
 import qualified Data.Map as M
@@ -13,6 +15,8 @@ import           Language.Haskell.Exts.Parser
 import           Language.Haskell.Exts.Syntax as H
 import           Language.Haskell.Exts.Pretty
 import           Language.Haskell.Exts.SrcLoc
+import           System.FilePath
+import           System.Directory
 
 import           Gibbon.L0.Syntax as L0
 import           Gibbon.Common
@@ -20,15 +24,22 @@ import           Gibbon.Common
 --------------------------------------------------------------------------------
 
 parseFile :: FilePath -> IO (PassM Prog0)
-parseFile path = do
+parseFile fp = do
+  (m, imports) <- parseFileUptoImports fp
+  pure $ desugarModule m
+
+parseFileUptoImports :: FilePath -> IO (Module SrcSpanInfo, [ImportDecl SrcSpanInfo])
+parseFileUptoImports fp = do
   let parse_mode = defaultParseMode { extensions =
                                         [EnableExtension ScopedTypeVariables]
                                         ++ (extensions defaultParseMode)}
-  parsed <- parseModuleWithMode parse_mode <$> (readFile path)
+  parsed <- parseModuleWithMode parse_mode <$> (readFile fp)
   case parsed of
-    ParseOk hs -> pure $ desugarModule hs
+    ParseOk hs -> case hs of
+                    (Module _ _ _ imports _) -> pure (hs, imports)
+                    _ -> error $ "desugarModule: " ++ prettyPrint hs
     ParseFailed _ er -> do
-      error ("haskell-src-exts failed: " ++ er)
+      error $ "haskell-src-exts failed: " ++ er
 
 data TopLevel
   = HDDef (DDef Ty0)
@@ -480,4 +491,94 @@ nameToStr :: Name a -> String
 nameToStr (Ident _ s)  = s
 nameToStr (Symbol _ s) = s
 
-instance Pretty SrcSpanInfo where
+instance Pretty SrcSpanInfo
+
+--------------------------------------------------------------------------------
+
+{-
+
+Importing modules:
+~~~~~~~~~~~~~~~~~~
+
+We use the same notion of search paths as GHC[1], except that GHC also has a
+set of "known" packages (base, containers, etc.) where it looks for modules.
+Gibbon doesn't have those, and the rootset for our search is a singleton {"."}.
+
+
+Consider this directory structure:
+
+    .
+    |── A
+    |   └── B
+    |       |── C.hs
+    |       |── D.hs
+    |       |── Foo.hs
+    |── Bar.hs
+
+
+If Bar.hs has a `import A.B.C`, we look for a file `./A/B/C.hs`. However, note
+that this design is not what we're used to when we work with Cabal/Stack.
+For example, modules C and D cannot import each other (I think).
+If we try to `import A.B.C` within D, GHC will look for `./A/B/A/B/C.hs`
+which isn't right of course. We can definitely be a bit more clever here.
+Maybe we could set the "root" of the search to be something other than "."
+and make it understand hierarchical modules better. But this v1 implementation
+doesn't do it.
+
+
+[1] https://downloads.haskell.org/ghc/8.6.4/docs/html/users_guide/separate_compilation.html?#the-search-path
+
+-}
+
+
+{-
+
+Don't process a 'import Prelude'. Those ops are built into Gibbon.
+
+This is the subset of Prelude that Gibbon-hs files should use.
+TODO: Note this down in a README somewhere.
+
+import Prelude as P ( (==), id, print
+                    , Int, (+), (-), (*), quot, (<), (>), (<=), (>=), (^), mod
+                    , Bool(..), (||), (&&)
+                    , Show)
+
+-}
+
+edge_list = [(1, 1, [2,3]), (2, 2, [3]), (3, 3, [])]
+
+(g, v_to_n, i_to_v) = graphFromEdges edge_list
+
+parseFile' :: FilePath -> IO (PassM Prog0)
+parseFile' fp = do
+  (m, imports) <- parseFileUptoImports fp
+  -- let dir = takeDirectory fp
+  -- mapM (procImport dir) imports
+  pure $ desugarModule m
+
+-- procImport :: FilePath -> ImportDecl a -> IO FilePath
+procImport fp imp_decl = do
+  let dir = takeDirectory fp
+  mb_fp <- findModule dir mod_name
+  case mb_fp of
+    Nothing -> error $ "Could not find import: " ++ prettyPrint imp_decl
+    Just fp -> do
+      (m, imports) <- parseFileUptoImports fp
+      _
+  where
+    mod_name = importModule imp_decl
+
+-- | Look for a module on the filesystem.
+findModule :: FilePath -> ModuleName a -> IO (Maybe FilePath)
+findModule dir m = do
+  let mod_fp  = dir </> moduleNameSlashes m <.> "hs"
+  doesFileExist mod_fp >>= \b ->
+    if b
+    then pure $ Just mod_fp
+    else pure Nothing
+
+-- | Returns the string version of the module name, with dots replaced by slashes.
+--
+moduleNameSlashes :: ModuleName a -> String
+moduleNameSlashes (ModuleName _ s) = dots_to_slashes s
+  where dots_to_slashes = map (\c -> if c == '.' then pathSeparator else c)
